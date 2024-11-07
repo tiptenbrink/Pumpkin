@@ -22,5 +22,5 @@ again.
 
 Then, the examples (for example `nqueens`) can be run with 
 ```
-python python/examples/nqueens.py 5
+python examples/nqueens.py 5
 ```
