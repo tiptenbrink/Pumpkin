@@ -1,9 +1,10 @@
 #![allow(unused)]
 
+use std::ops::Range;
 use std::{
     collections::{HashMap, HashSet},
     i32,
-    num::NonZero,
+    num::NonZero, ops::RangeInclusive,
 };
 
 use crate::{
@@ -197,6 +198,7 @@ impl ResourceProfile {
                 // Next event starts at next_event.time, so previous one ends one time earlier
                 let interval_end = next_event.time - 1;
 
+                // TODO see if we ever need the active later? 
                 let interval = Interval {
                     start: interval_start,
                     end_inclusive: interval_end,
@@ -221,14 +223,124 @@ impl ResourceProfile {
         Ok(Self { intervals })
     }
 
-    fn time_table_filtering(
-        &self,
-        bounds: &BoundsSlice,
-        capacity: u32,
-    ) -> Result<(), TimeTableInconsistency> {
-        for (lb, ub) in bounds {}
+    fn intersecting_intervals(&self, lb: i32, ub: i32) -> Option<RangeInclusive<usize>> {
+        debug_assert!(lb <= ub);
 
-        Ok(())
+        // We return the ub_i s.t. ub >= interval_(ub_i).start (*1)
+        // But also ub < interval(ub_i+1).start (*2)
+        let ub_i = match &self.intervals.binary_search_by_key(&ub, |i| i.start) {
+            // ub == interval_i.start, so (*1) holds
+            // ub_i.start < ub_(i+1).start, so (*2) holds
+            Ok(i) => *i,
+            Err(i) => {
+                // In this case we know ub > interval_(i-1).start && ub < interval_i.start
+                // However, in case i == 0, ub < interval_0.start
+                // Also lb <= ub so lb <= ub < interval_0.start, so no intersection
+                if *i == 0 {
+                    return None
+                }
+
+                // Here we know that ub > interval_(i-1), since we return i-1, (*1) holds
+                // Also ub < interval_i.start from earlier so (*2) holds
+                (*i - 1) 
+            },
+        };
+
+
+        // lb <= interval_(lb_i).end_inclusive (*1)
+        // lb > interval_(lb_i - 1).end_inclusive (*2)
+        let lb_i = match &self.intervals.binary_search_by_key(&lb, |i| i.end_inclusive) {
+            // lb == interval_i.end_incl
+            Ok(i) => *i,
+            Err(i) => {
+                // In this case we know lb > interval_(i-1).end_inclusive && lb < interval_i.end_inclusive
+                // So it can never intersect with interval_(i-1), because the entire interval is less than
+                // However, it might still intersect with interval_i
+                *i
+            },
+        };
+
+        // Also lb > interval_(lb_i - 1).end_inclusive, so no intersection with earlier
+        // Also ub < interval(ub_i+1).start, so no intersection with later
+        // So definitely no intersections with lower lb_i or higher ub_i!
+
+        if lb_i < ub_i {
+            // Then lb <= interval_(lb_i).end_inclusive < interval_(ub_i).start <= ub
+            return Some(lb_i..=ub_i)
+        } else if lb_i == ub_i {
+            // So lb_i == ub_i, just i from now on
+            // lb <= interval_i.end
+            // ub >= interval_i.start
+            // So only way there is no intersection is if lb > interval_i.end
+            // But we have lb <= interval_i.end, so we also have intersection!
+            return Some(lb_i..=ub_i)
+        } else {
+            // ub_i < lb_i
+            // ub >= interval_(ub_i).start
+            // But ub < interval(ub_i+1).start
+            // So ub < interval_(lb_i).start, since lb_i >= ub_i+1
+            // So lb <= ub < interval_(lb_i).start
+            
+            // lb > interval_(lb_i-1).end_inclusive
+            // lb > interval_(ub_i).end_inclusive, since ub_i <= lb_i-1
+            // interval_(ub_i).end_inclusive < lb <= ub < interval_(lb_i).start
+
+            // But ub < interval_(ub_i+1).start
+            // But also ub > interval_(ub_i).end_inclusive
+            // So no space in between! So this is inconsistent and cannot happen
+            unreachable!()
+        }
+    }
+
+    fn time_table_filtering<const SIZE: usize>(
+        &self,
+        bounds: &[(i32, i32); SIZE],
+        usages: &[u32; SIZE],
+        capacity: u32,
+    ) -> [(i32, i32); SIZE] {
+        let mut new_bounds = Vec::with_capacity(SIZE);
+
+        for (i, (lb, ub)) in bounds.iter().enumerate() {
+            let activity_usage = usages[i];
+
+            let (lb, ub) = if let Some(intersections) = self.intersecting_intervals(*lb, *ub) {
+                let mut new_lb = *lb;
+                
+                for interval in intersections.clone() {
+                    let interval = &self.intervals[interval];
+                    let interval_usage = interval.usage;
+
+                    if interval_usage + (activity_usage as i64) <= (capacity as i64) {
+                        break;
+                    }
+
+                    new_lb = interval.end_inclusive+1;
+                }
+
+                let mut new_ub = *ub;
+
+                for interval in intersections.rev() {
+                    let interval = &self.intervals[interval];
+                    let interval_usage = interval.usage;
+
+                    if interval_usage + (activity_usage as i64) <= (capacity as i64) {
+                        // Lower bound cannot be changed
+                        // Maybe do holes?
+                        break;
+                    }
+
+                    new_ub = interval.start-1;
+                }
+
+                (new_lb, new_ub)
+            } else {
+                (*lb, *ub)
+            };
+
+            new_bounds.push((lb, ub));
+        }
+
+        new_bounds.try_into().unwrap()
     }
 }
 
@@ -238,18 +350,29 @@ impl<const SIZE: usize> Propagator for CumulativePropagator<SIZE> {
     }
 
     fn debug_propagate_from_scratch(&self, context: PropagationContextMut) -> PropagationStatusCP {
+        let bounds = self.start_times.map(|v| {
+            (context.lower_bound(&v), context.upper_bound(&v))
+        });
+        
         // Is it right that we don't know what event caused the propagator to be called? Useful for global propagator?
         let profile = self
-            .build_resource_profile(|v| {
-                let var = &self.start_times[v];
-                (context.lower_bound(var), context.upper_bound(var))
-            })
+            .build_resource_profile_from_bounds(&bounds)
             .map_err(|e| {
                 e.into_prop_conj(
                     self.start_times.as_slice(),
                     self.processing_times.as_slice(),
                 )
             })?;
+        
+        let new_bounds = profile.time_table_filtering(&bounds, &self.resource_usages, self.resource_capacity);
+
+        for (i, (old_lb, old_ub)) in bounds.into_iter().enumerate() {
+            let (lb, ub) = new_bounds[i];
+
+            if lb > old_lb {
+                context.set_lower_bound(var, bound, reason)
+            }
+        }
 
         Ok(())
     }
